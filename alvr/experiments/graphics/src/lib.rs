@@ -2,6 +2,10 @@ pub mod convert;
 pub mod foveated_rendering;
 pub mod slicing;
 
+pub use ash;
+pub use wgpu;
+pub use wgpu_hal;
+
 use ash::vk;
 use std::{num::NonZeroU32, sync::Arc};
 use wgpu::{
@@ -114,6 +118,7 @@ pub fn create_default_render_pipeline(
                 write_mask: ColorWrites::ALL,
             }],
         }),
+        multiview: None,
     });
 
     let bind_group_entries = bindings

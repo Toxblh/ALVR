@@ -1,18 +1,25 @@
 use super::{OpenxrSwapchain, XrContext};
 use alvr_common::{glam::UVec2, prelude::*};
 use alvr_graphics::{
+    ash::{
+        self,
+        extensions::khr,
+        vk::{self, Handle},
+    },
     convert::{
         self, GraphicsContextVulkanInitDesc, SwapchainCreateData, SwapchainCreateInfo, TextureType,
         TARGET_VULKAN_VERSION,
     },
-    GraphicsContext,
+    wgpu::{Device, TextureFormat, TextureViewDescriptor},
+    wgpu_hal as hal, GraphicsContext,
 };
-use ash::vk::{self, Handle};
 use openxr as xr;
 use parking_lot::Mutex;
-use std::{ffi::CStr, mem, sync::Arc};
-use wgpu::{Device, TextureFormat, TextureViewDescriptor};
-use wgpu_hal as hal;
+use std::{
+    ffi::{CStr, CString},
+    mem,
+    sync::Arc,
+};
 
 pub fn create_graphics_context(xr_context: &XrContext) -> StrResult<GraphicsContext> {
     let entry = unsafe { ash::Entry::new().unwrap() };
@@ -48,6 +55,17 @@ pub fn create_graphics_context(xr_context: &XrContext) -> StrResult<GraphicsCont
         .vulkan_graphics_device(xr_context.system, raw_instance.handle().as_raw() as _))?
         as _);
 
+    // unsafe {
+    //     let device_exts = raw_instance
+    //         .enumerate_device_extension_properties(raw_physical_device)
+    //         .unwrap();
+    //     let device_exts_cstrs = device_exts
+    //         .iter()
+    //         .map(|ext| CStr::from_ptr(ext.extension_name.as_ptr() as _))
+    //         .collect::<Vec<_>>();
+    //     dbg!(device_exts_cstrs);
+    // }
+
     let queue_family_index = unsafe {
         raw_instance
             .get_physical_device_queue_family_properties(raw_physical_device)
@@ -71,9 +89,23 @@ pub fn create_graphics_context(xr_context: &XrContext) -> StrResult<GraphicsCont
             raw_instance.clone(),
             raw_physical_device,
         )?;
+
         let extensions = temp_adapter
             .adapter
             .required_device_extensions(temp_adapter.features);
+        let mut extensions_ptrs = extensions.iter().map(|x| x.as_ptr()).collect::<Vec<_>>();
+        if cfg!(target_os = "android") {
+            // For importing decoder images into Vulkan
+            let extra_extensions = [
+                vk::KhrExternalMemoryFn::name(),
+                vk::AndroidExternalMemoryAndroidHardwareBufferFn::name(),
+            ]
+            .into_iter()
+            .map(|ext| ext.as_ptr());
+
+            extensions_ptrs.extend(extra_extensions);
+        }
+
         let mut features = temp_adapter.adapter.physical_device_features(
             &extensions,
             temp_adapter.features,
@@ -84,7 +116,6 @@ pub fn create_graphics_context(xr_context: &XrContext) -> StrResult<GraphicsCont
             .queue_family_index(queue_family_index)
             .queue_priorities(&[1.0])
             .build()];
-        let extensions_ptrs = extensions.iter().map(|x| x.as_ptr()).collect::<Vec<_>>();
         let info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extensions_ptrs);
@@ -151,7 +182,7 @@ pub fn create_swapchain(
                 .map(|raw_image| vk::Image::from_raw(*raw_image))
                 .collect(),
             hal_usage,
-            drop_guard: Some(Arc::clone(&swapchain) as _),
+            drop_guard: Some(Arc::new(()) as _),
         },
         SwapchainCreateInfo {
             usage,

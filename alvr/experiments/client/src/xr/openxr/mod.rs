@@ -13,9 +13,8 @@ use alvr_common::{
     prelude::*,
     Fov, MotionData,
 };
-use alvr_graphics::GraphicsContext;
+use alvr_graphics::{ash::vk::Handle, wgpu::TextureView, GraphicsContext};
 use alvr_session::TrackingSpace;
-use ash::vk::Handle;
 use openxr as xr;
 use parking_lot::{Mutex, MutexGuard};
 use std::{
@@ -27,7 +26,6 @@ use std::{
     thread,
     time::Duration,
 };
-use wgpu::TextureView;
 
 pub struct XrContext {
     pub instance: xr::Instance,
@@ -218,6 +216,7 @@ pub struct XrSession {
     xr_context: Arc<XrContext>,
     graphics_context: Arc<GraphicsContext>,
     inner: xr::Session<xr::Vulkan>,
+    recommended_view_sizes: Vec<UVec2>,
     scene_swapchains: Vec<OpenxrSwapchain>,
     stream_swapchains: Vec<OpenxrSwapchain>,
     environment_blend_mode: xr::EnvironmentBlendMode,
@@ -239,6 +238,11 @@ impl XrSession {
     pub fn new(
         xr_context: Arc<XrContext>,
         graphics_context: Arc<GraphicsContext>,
+        stream_views_size: UVec2,
+        stream_action_types: &[(String, XrActionType)],
+        stream_profile_descs: Vec<XrProfileDesc>,
+        reference_space_type: TrackingSpace,
+        environment_blend_mode: xr::EnvironmentBlendMode,
     ) -> StrResult<Self> {
         let (session, frame_waiter, frame_stream) = unsafe {
             trace_err!(xr_context.instance.create_session_with_guard::<xr::Vulkan>(
@@ -254,7 +258,7 @@ impl XrSession {
             ))?
         };
 
-        let views = xr_context
+        let view_configs = xr_context
             .instance
             .enumerate_view_configuration_views(
                 xr_context.system,
@@ -262,45 +266,47 @@ impl XrSession {
             )
             .unwrap();
 
-        let scene_swapchains = views
+        let recommended_view_sizes = view_configs
             .into_iter()
             .map(|config| {
-                graphics_interop::create_swapchain(
-                    &graphics_context.device,
-                    &session,
-                    UVec2::new(
-                        config.recommended_image_rect_width,
-                        config.recommended_image_rect_height,
-                    ),
+                UVec2::new(
+                    config.recommended_image_rect_width,
+                    config.recommended_image_rect_height,
                 )
+            })
+            .collect::<Vec<_>>();
+
+        let scene_swapchains = recommended_view_sizes
+            .iter()
+            .cloned()
+            .map(|size| {
+                graphics_interop::create_swapchain(&graphics_context.device, &session, size)
             })
             .collect();
 
-        // Recreated later
         let stream_swapchains = (0..2)
             .map(|_| {
                 graphics_interop::create_swapchain(
                     &graphics_context.device,
                     &session,
-                    UVec2::new(1, 1),
+                    stream_views_size,
                 )
             })
             .collect();
 
-        let environment_blend_mode = *xr_context.environment_blend_modes.first().unwrap();
-
         let interaction_context = OpenxrInteractionContext::new(
             &xr_context,
             session.clone(),
-            &[],
-            vec![],
-            TrackingSpace::Local,
+            stream_action_types,
+            stream_profile_descs,
+            reference_space_type,
         )?;
 
         Ok(Self {
             xr_context,
             graphics_context,
             inner: session,
+            recommended_view_sizes,
             scene_swapchains,
             stream_swapchains,
             environment_blend_mode,
@@ -313,37 +319,8 @@ impl XrSession {
         })
     }
 
-    pub fn update_for_stream(
-        &mut self,
-        view_size: UVec2,
-        action_types: &[(String, XrActionType)],
-        profile_descs: Vec<XrProfileDesc>,
-        reference_space_type: TrackingSpace,
-        environment_blend_mode: xr::EnvironmentBlendMode,
-    ) -> StrResult {
-        // Note: if called between begin_frame() and end_frame(), the old swapchains will live until
-        // presented, then they will get dropped. It can't happen to present an unacquired swapchain.
-        self.stream_swapchains = (0..2)
-            .map(|_| {
-                graphics_interop::create_swapchain(
-                    &self.graphics_context.device,
-                    &self.inner,
-                    view_size,
-                )
-            })
-            .collect();
-
-        self.interaction_context = OpenxrInteractionContext::new(
-            &self.xr_context,
-            self.inner.clone(),
-            action_types,
-            profile_descs,
-            reference_space_type,
-        )?;
-
-        self.environment_blend_mode = environment_blend_mode;
-
-        Ok(())
+    pub fn recommended_view_sizes(&self) -> &[UVec2] {
+        &self.recommended_view_sizes
     }
 
     fn acquire_views(swapchains: &[OpenxrSwapchain]) -> Vec<AcquiredXrSwapchain> {
