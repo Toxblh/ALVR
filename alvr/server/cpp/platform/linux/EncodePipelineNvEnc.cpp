@@ -1,5 +1,6 @@
 #include "EncodePipelineNvEnc.h"
 #include "ALVR-common/packet_types.h"
+#include "alvr_server/Logger.h"
 #include "alvr_server/Settings.h"
 #include "ffmpeg_helper.h"
 #include <chrono>
@@ -26,8 +27,30 @@ const char *encoder(ALVR_CODEC codec) {
 alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frames,
                                                VkFrameCtx &vk_frame_ctx) {
     int err;
+
     for (auto &input_frame : input_frames) {
-        vk_frames.push_back(input_frame.make_av_frame(vk_frame_ctx).release());
+        vk_frames.push_back(input_frame.make_av_frame(vk_frame_ctx).get());
+    }
+
+    err = AVUTIL.av_hwdevice_ctx_create(&hw_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
+    if (err < 0) {
+        throw alvr::AvException("Failed to create a CUDA device:", err);
+    }
+
+    AVBufferRef *hw_frames_ref;
+    auto input_frame_ctx = (AVHWFramesContext*)vk_frame_ctx.ctx->data;
+
+    if (!(hw_frames_ref = AVUTIL.av_hwframe_ctx_alloc(hw_ctx))) {
+        throw std::runtime_error("Failed to create CUDA frame context.");
+    }
+    auto frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ref->data);
+    frames_ctx->format = AV_PIX_FMT_CUDA;
+    frames_ctx->sw_format = AV_PIX_FMT_BGR0;
+    frames_ctx->width = input_frame_ctx->width;
+    frames_ctx->height = input_frame_ctx->height;
+    if ((err = AVUTIL.av_hwframe_ctx_init(hw_frames_ref)) < 0) {
+        AVUTIL.av_buffer_unref(&hw_frames_ref);
+        throw alvr::AvException("Failed to initialize CUDA frame context:", err);
     }
 
     const auto &settings = Settings::Instance();
@@ -82,6 +105,8 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frame
     }
 
     hw_frame = AVUTIL.av_frame_alloc();
+    AVUTIL.av_hwframe_get_buffer(hw_frames_ref, hw_frame, 0);
+    AVUTIL.av_buffer_unref(&hw_frames_ref);
 }
 
 alvr::EncodePipelineNvEnc::~EncodePipelineNvEnc() {
@@ -94,10 +119,17 @@ alvr::EncodePipelineNvEnc::~EncodePipelineNvEnc() {
 void alvr::EncodePipelineNvEnc::PushFrame(uint32_t frame_index, bool idr) {
     assert(frame_index < vk_frames.size());
 
-    int err = AVUTIL.av_hwframe_transfer_data(hw_frame, vk_frames[frame_index], 0);
+    auto hwframe_transfer_data_start = std::chrono::steady_clock::now();
+    int err =
+        AVUTIL.av_hwframe_transfer_data(hw_frame, vk_frames[frame_index], 0);
     if (err) {
         throw alvr::AvException("av_hwframe_transfer_data", err);
     }
+    auto hwframe_transfer_data_end = std::chrono::steady_clock::now();
+    auto hwframe_transfer_data_time = std::chrono::duration_cast<std::chrono::microseconds>(
+        hwframe_transfer_data_end - hwframe_transfer_data_start);
+
+    Info("av_hwframe_transfer_data took %d us", hwframe_transfer_data_time.count());
 
     hw_frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     hw_frame->pts = std::chrono::steady_clock::now().time_since_epoch().count();
