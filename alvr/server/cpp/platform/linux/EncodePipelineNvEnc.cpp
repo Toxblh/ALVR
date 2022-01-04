@@ -29,7 +29,7 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frame
     int err;
 
     for (auto &input_frame : input_frames) {
-        vk_frames.push_back(input_frame.make_av_frame(vk_frame_ctx).get());
+        vk_frames.push_back(input_frame.make_av_frame(vk_frame_ctx).release());
     }
 
     err = AVUTIL.av_hwdevice_ctx_create(&hw_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
@@ -38,16 +38,19 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frame
     }
 
     AVBufferRef *hw_frames_ref;
-    auto input_frame_ctx = (AVHWFramesContext*)vk_frame_ctx.ctx->data;
+    auto input_frame_ctx = (AVHWFramesContext *)vk_frame_ctx.ctx->data;
 
     if (!(hw_frames_ref = AVUTIL.av_hwframe_ctx_alloc(hw_ctx))) {
         throw std::runtime_error("Failed to create CUDA frame context.");
     }
-    auto frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ref->data);
+    auto frames_ctx = (AVHWFramesContext *)(hw_frames_ref->data);
     frames_ctx->format = AV_PIX_FMT_CUDA;
     frames_ctx->sw_format = AV_PIX_FMT_BGR0;
     frames_ctx->width = input_frame_ctx->width;
     frames_ctx->height = input_frame_ctx->height;
+    frames_ctx->device_ref = hw_ctx;
+    frames_ctx->device_ctx = (AVHWDeviceContext *)hw_ctx->data;
+
     if ((err = AVUTIL.av_hwframe_ctx_init(hw_frames_ref)) < 0) {
         AVUTIL.av_buffer_unref(&hw_frames_ref);
         throw alvr::AvException("Failed to initialize CUDA frame context:", err);
@@ -88,7 +91,7 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frame
      *
      * We just to ignore the alpha channel and it's done
      */
-    encoder_ctx->pix_fmt = AV_PIX_FMT_BGR0;
+    encoder_ctx->pix_fmt = AV_PIX_FMT_CUDA;
     encoder_ctx->width = settings.m_renderWidth;
     encoder_ctx->height = settings.m_renderHeight;
     encoder_ctx->time_base = {std::chrono::steady_clock::period::num,
@@ -98,6 +101,8 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(std::vector<VkFrame> &input_frame
     encoder_ctx->max_b_frames = 0;
     encoder_ctx->gop_size = 30;
     encoder_ctx->bit_rate = settings.mEncodeBitrateMBs * 1000 * 1000;
+    encoder_ctx->hw_device_ctx = AVUTIL.av_buffer_ref(hw_ctx);
+    encoder_ctx->hw_frames_ctx = AVUTIL.av_buffer_ref(hw_frames_ref);
 
     err = AVCODEC.avcodec_open2(encoder_ctx, codec, NULL);
     if (err < 0) {
@@ -120,8 +125,7 @@ void alvr::EncodePipelineNvEnc::PushFrame(uint32_t frame_index, bool idr) {
     assert(frame_index < vk_frames.size());
 
     auto hwframe_transfer_data_start = std::chrono::steady_clock::now();
-    int err =
-        AVUTIL.av_hwframe_transfer_data(hw_frame, vk_frames[frame_index], 0);
+    int err = AVUTIL.av_hwframe_transfer_data(hw_frame, vk_frames[frame_index], 0);
     if (err) {
         throw alvr::AvException("av_hwframe_transfer_data", err);
     }
@@ -134,7 +138,10 @@ void alvr::EncodePipelineNvEnc::PushFrame(uint32_t frame_index, bool idr) {
     hw_frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     hw_frame->pts = std::chrono::steady_clock::now().time_since_epoch().count();
 
+    Info("Set hw params");
+
     if ((err = AVCODEC.avcodec_send_frame(encoder_ctx, hw_frame)) < 0) {
+        Info("avcodec_send_frame failed: %d", err);
         throw alvr::AvException("avcodec_send_frame failed:", err);
     }
 }

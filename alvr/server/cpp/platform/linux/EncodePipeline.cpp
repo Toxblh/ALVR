@@ -95,11 +95,15 @@ bool alvr::EncodePipeline::GetEncoded(std::vector<uint8_t> &out)
   AVPacket * enc_pkt = AVCODEC.av_packet_alloc();
   int err = AVCODEC.avcodec_receive_packet(encoder_ctx, enc_pkt);
   if (err == AVERROR(EAGAIN)) {
+    Info("failed to encode EAGAIN: %d", err);
     return false;
   } else if (err) {
+    Info("failed to encode: %d", err);
     throw alvr::AvException("failed to encode", err);
   }
   filter_NAL(enc_pkt->data, enc_pkt->size, out);
+  Info("failed filter_NAL");
   AVCODEC.av_packet_free(&enc_pkt);
+  Info("av_packet_free");
   return true;
 }
